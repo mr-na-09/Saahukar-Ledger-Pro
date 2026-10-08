@@ -28,6 +28,7 @@ test('Free permits ten customers and safely rejects an eleventh', () => {
   const free = createFreeEntitlement();
   assert.equal(canAddCustomer(9, free), true);
   assert.equal(canAddCustomer(10, free), false);
+  assert.equal(hasFeature('backup_restore', free), true);
 });
 
 test('active Pro has no customer cap and receives configured Pro features', () => {

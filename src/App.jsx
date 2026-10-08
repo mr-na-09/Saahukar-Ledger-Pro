@@ -1,16 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Home, LockKeyhole } from 'lucide-react';
-import { supabase, supabaseReady } from './supabaseClient';
 import { calculateLiveInterest, processPartPayment } from './utils/interestEngine';
 import { generatePDFReceipt } from './utils/pdfGenerator';
 import { securePin } from './services/security';
-import { canAddCustomer, consumeWhatsAppReminder, createFreeEntitlement, FREE_CUSTOMER_LIMIT, getCurrentPlan, getSubscriptionStatus, hasFeature, isPro, PLAN_PRICING, refreshEntitlement } from './services/entitlements';
+import { canAddCustomer, consumeWhatsAppReminder, createFreeEntitlement, FREE_CUSTOMER_LIMIT, getCurrentPlan, getSubscriptionStatus, hasFeature, isPro, PLAN_PRICING } from './services/entitlements';
 import CustomerDirectory from './components/CustomerDirectory';
 import AuthPinModal from './components/AuthPinModal';
 import CustomerProfile from './components/CustomerProfile';
 import PrivateLedger from './components/PrivateLedger';
 import Reports from './components/Reports';
 import { storageService, storagePlatform } from './services/storage/storageService';
+import { createLocalAccount, getActiveLocalSession, setActiveLocalUser, signInLocalAccount, signOutLocalAccount, updateLocalProfile } from './services/localAccounts';
+import { parseBackup, serializeCsvBackup, serializeJsonBackup } from './utils/backup';
 
 const WINDOWS_DOWNLOAD_URL = 'https://drive.google.com/uc?export=download&id=1YQvRZlr-Lu5HQulD1YSueGsMLOVSqP9S';
 const ANDROID_DOWNLOAD_URL = 'https://drive.google.com/uc?export=download&id=15L06TBi1H69MFyW11P2CCVXdHwRwpJBt';
@@ -50,6 +51,25 @@ function createPaymentId() {
   return Date.now() + Math.floor(Math.random() * 1000);
 }
 
+function getSessionProfile(session) {
+  return {
+    ...(session?.user?.user_metadata || {}),
+    email: session?.user?.email || '',
+    phone_number: session?.user?.user_metadata?.phone_number || session?.user?.phone || ''
+  };
+}
+
+function getInitialLocalState() {
+  try {
+    return { session: getActiveLocalSession(), actionMessage: { type: '', text: '' } };
+  } catch (error) {
+    return {
+      session: null,
+      actionMessage: { type: 'error', text: error.message || 'Local account data could not be read. Import a backup to restore access.' }
+    };
+  }
+}
+
 const welcomeCopy = {
   EN: {
     greeting: 'A warm welcome',
@@ -60,12 +80,12 @@ const welcomeCopy = {
     signup: 'Sign up',
     accountTitle: 'Create your account',
     signupSteps: [
-      'Choose Sign up. Enter your name, mobile number, email and password, then select Create Account.',
-      'Check your Inbox and Spam/Junk folder. Open the confirmation link in the email to verify your address.',
-      'Return here and log in with the same email and password. Your default security PIN is 1234; change it under Tools after logging in.'
+      'Choose Sign up and enter your name, mobile number, email and password.',
+      'Your account and ledger are stored in this browser only; they do not sync across devices.',
+      'Sign in here. The default security PIN is 1234; change it under Tools after logging in.'
     ],
-    emailNote: 'Your confirmation email will arrive with the sender name “Sahukar Ledger Pro”.',
-    reset: 'Forgot your password? Select Check password reset on the login form and follow the link sent to your email.',
+    emailNote: 'Download JSON or CSV backups regularly. After browser data is cleared, create your local account again, sign in, and import the backup from Tools.',
+    reset: 'Local passwords cannot be reset by email. Keep your password and an external backup safe.',
     guideTitle: 'Using the ledger',
     guide: [
       ['Home / Dashboard', 'See active accounts, principal, interest and collections.'],
@@ -91,12 +111,12 @@ const welcomeCopy = {
     signup: 'साइन अप',
     accountTitle: 'अपना अकाउंट बनाएं',
     signupSteps: [
-      'साइन अप चुनें। नाम, मोबाइल नंबर, ईमेल और पासवर्ड भरकर Create Account दबाएं।',
-      'Inbox और Spam/Junk फ़ोल्डर देखें। ईमेल में आए confirmation link को खोलकर पता verify करें।',
-      'वापस आकर उसी ईमेल और पासवर्ड से लॉग इन करें। डिफ़ॉल्ट सुरक्षा PIN 1234 है; लॉग इन के बाद Tools में इसे बदलें।'
+      'Sign up चुनें और नाम, मोबाइल, ईमेल और पासवर्ड भरें।',
+      'आपका अकाउंट और लेजर केवल इसी ब्राउज़र में सेव होगा; दूसरे डिवाइस से sync नहीं होगा।',
+      'यहाँ लॉग इन करें। डिफ़ॉल्ट PIN 1234 है; लॉग इन के बाद Tools में बदलें।'
     ],
-    emailNote: 'आपका confirmation email “Sahukar Ledger Pro” नाम से आएगा।',
-    reset: 'पासवर्ड भूल गए? लॉग इन फॉर्म में Check password reset चुनें और ईमेल में आए लिंक का पालन करें।',
+    emailNote: 'नियमित रूप से JSON या CSV बैकअप डाउनलोड करें। ब्राउज़र डेटा मिटने के बाद अकाउंट फिर बनाकर लॉग इन करें और Tools से बैकअप import करें।',
+    reset: 'लोकल पासवर्ड ईमेल से reset नहीं हो सकता। पासवर्ड और बाहरी बैकअप सुरक्षित रखें।',
     guideTitle: 'लेजर का इस्तेमाल',
     guide: [
       ['Home / Dashboard', 'चालू खाते, मूलधन, ब्याज और वसूली का सार देखें।'],
@@ -122,12 +142,12 @@ const welcomeCopy = {
     signup: 'Sign up',
     accountTitle: 'Account kaise banayein',
     signupSteps: [
-      'Sign up chunein. Naam, mobile, email aur password bharke Create Account dabayein.',
-      'Inbox aur Spam/Junk folder check karein. Email ka confirmation link kholkar email verify karein.',
-      'Yahan wapas aakar same email/password se log in karein. Default security PIN 1234 hai; login ke baad Tools mein ise badlein.'
+      'Sign up chunein aur naam, mobile, email aur password enter karein.',
+      'Account aur ledger sirf isi browser mein save honge; dusre device par sync nahi honge.',
+      'Yahin sign in karein. Default security PIN 1234 hai; login ke baad Tools mein badlein.'
     ],
-    emailNote: 'Aapka confirmation email “Sahukar Ledger Pro” naam se aayega.',
-    reset: 'Password bhool gaye? Login form par Check password reset dabayein aur email link follow karein.',
+    emailNote: 'Regular JSON ya CSV backup download karein. Browser data clear ho to local account dobara bana kar sign in karein, phir Tools se backup import karein.',
+    reset: 'Local password email se reset nahi ho sakta. Password aur external backup sambhal kar rakhein.',
     guideTitle: 'App kaise use karein',
     guide: [
       ['Home / Dashboard', 'Active accounts, principal, interest aur collections ka summary dekhein.'],
@@ -202,160 +222,25 @@ function WelcomeGuide({ onLogin, onSignup, language, onLanguage }) {
   );
 }
 
-function AccountReady({ hasSession, onContinue, onLogin }) {
-  return (
-    <div className="auth-scene min-h-screen flex items-center justify-center p-4">
-      <main className="auth-card w-full max-w-md rounded-xl border p-8 text-center">
-        <div className="auth-brand -m-8 mb-6 rounded-t-xl p-6 text-left">
-          <div className="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
-          <div>
-            <p className="eyebrow">Email confirmed</p>
-            <h1 className="text-2xl font-bold text-white">Sahukar Ledger Pro</h1>
-            <p className="brand-subtitle mt-1 text-sm">Your account is ready</p>
-          </div>
-        </div>
-        <h2 className="text-xl font-bold text-slate-800">Your account is ready</h2>
-        <p className="mt-2 text-sm text-slate-600">Email confirmation complete ho gaya. Ab aap apna ledger account use kar sakte hain.</p>
-        <button type="button" onClick={hasSession ? onContinue : onLogin} className="mt-6 w-full rounded-lg bg-blue-600 px-4 py-3 font-bold text-white transition hover:bg-blue-700">
-          {hasSession ? 'Continue to secure PIN' : 'Log in to your account'}
-        </button>
-      </main>
-    </div>
-  );
-}
-
-function getStoredData(userId) {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(`sahukar-data-${userId}`) || '{"customers":[],"payments":[]}');
-    return {
-      customers: Array.isArray(parsed?.customers) ? parsed.customers : [],
-      payments: Array.isArray(parsed?.payments) ? parsed.payments : []
-    };
-  } catch {
-    return { customers: [], payments: [] };
-  }
-}
-
-function mergeWebLedgers(localData, cloudData) {
-  const customersById = new Map((cloudData.customers || []).map(customer => [String(customer.id), customer]));
-  for (const localCustomer of localData.customers || []) {
-    const cloudCustomer = customersById.get(String(localCustomer.id));
-    const localUpdatedAt = Date.parse(localCustomer.updated_at || 0);
-    const cloudUpdatedAt = Date.parse(cloudCustomer?.updated_at || 0);
-    const hasNewerAdvance = Boolean(localCustomer.last_advance_date) && String(localCustomer.last_advance_date) >= String(cloudCustomer?.last_advance_date || cloudCustomer?.loan_date || '');
-    if (!cloudCustomer || localUpdatedAt > cloudUpdatedAt || hasNewerAdvance) {
-      customersById.set(String(localCustomer.id), localCustomer);
-    }
-  }
-
-  const paymentsById = new Map((cloudData.payments || []).map(payment => [String(payment.id), payment]));
-  for (const localPayment of localData.payments || []) paymentsById.set(String(localPayment.id), localPayment);
-  return { customers: Array.from(customersById.values()), payments: Array.from(paymentsById.values()) };
-}
-
-async function syncPendingWebChanges(userId, localData, cloudData) {
-  const cloudCustomers = new Map((cloudData.customers || []).map(customer => [String(customer.id), customer]));
-  const pendingCustomers = (localData.customers || []).filter(customer => {
-    const cloudCustomer = cloudCustomers.get(String(customer.id));
-    if (!cloudCustomer) return true;
-    const localUpdatedAt = Date.parse(customer.updated_at || '') || 0;
-    const cloudUpdatedAt = Date.parse(cloudCustomer.updated_at || '') || 0;
-    const hasNewerAdvance = Boolean(customer.last_advance_date) && String(customer.last_advance_date) > String(cloudCustomer.last_advance_date || cloudCustomer.loan_date || '');
-    return localUpdatedAt > cloudUpdatedAt || hasNewerAdvance;
-  });
-  const cloudPayments = new Map((cloudData.payments || []).map(payment => [String(payment.id), payment]));
-  const pendingPayments = (localData.payments || []).filter(payment => {
-    const cloudPayment = cloudPayments.get(String(payment.id));
-    return !cloudPayment || (Date.parse(payment.created_at || '') || 0) > (Date.parse(cloudPayment.created_at || '') || 0);
-  });
-
-  if (pendingCustomers.length > 0) {
-    const { error } = await supabase.from('customers').upsert(pendingCustomers.map(customer => ({ ...customer, user_id: userId })), { onConflict: 'id' });
-    if (error) throw error;
-  }
-  if (pendingPayments.length > 0) {
-    const { error } = await supabase.from('payments').upsert(pendingPayments, { onConflict: 'id' });
-    if (error) throw error;
-  }
-}
-
-async function fetchUserDataFromSupabase(userId) {
-  const { data: customerRows, error: customerError } = await supabase
-    .from('customers')
-    .select('*')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false });
-
-  if (customerError) throw customerError;
-
-  const customerIds = (customerRows || []).map(customer => customer.id);
-  let paymentRows = [];
-
-  if (customerIds.length > 0) {
-    const { data: fetchedPayments, error: paymentError } = await supabase
-      .from('payments')
-      .select('*')
-      .in('customer_id', customerIds)
-      .order('created_at', { ascending: false });
-
-    if (paymentError) throw paymentError;
-    paymentRows = fetchedPayments || [];
-  }
-
-  return {
-    customers: customerRows || [],
-    payments: paymentRows || []
-  };
-}
-
-async function migrateLocalDataToSupabase(userId, localData) {
-  if (localData.customers.length === 0) return false;
-
-  const customers = localData.customers.map(customer => ({
-    ...customer,
-    user_id: userId
-  }));
-  const payments = localData.payments.map((payment, index) => ({
-    ...payment,
-    id: Number(payment.id) || Date.now() + index,
-    customer_id: Number(payment.customer_id)
-  }));
-
-  const { error: customerError } = await supabase
-    .from('customers')
-    .upsert(customers, { onConflict: 'id' });
-  if (customerError) throw customerError;
-
-  if (payments.length > 0) {
-    const { error: paymentError } = await supabase
-      .from('payments')
-      .upsert(payments, { onConflict: 'id' });
-    if (paymentError) throw paymentError;
-  }
-
-  return true;
-}
-
 export default function App() {
   // Auth & Session States
-  const [session, setSession] = useState(null);
+  const [initialLocalState] = useState(getInitialLocalState);
+  const [session, setSession] = useState(initialLocalState.session);
+  const restoredUser = initialLocalState.session?.user;
   const [authMode, setAuthMode] = useState('LOGIN'); // 'LOGIN' or 'SIGNUP'
   const [showWelcome, setShowWelcome] = useState(true);
-  const [emailConfirmationReady, setEmailConfirmationReady] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(Boolean(initialLocalState.session));
   const [dataLoading, setDataLoading] = useState(false);
   const [dataError] = useState('');
-  const [actionMessage, setActionMessage] = useState({ type: '', text: '' });
+  const [actionMessage, setActionMessage] = useState(initialLocalState.actionMessage);
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
   const [pinLocked, setPinLocked] = useState(false);
-  const [entitlementState, setEntitlementState] = useState({ userId: null, value: createFreeEntitlement('signed-out') });
 
   // Sign In / Sign Up Form States
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [resettingPassword, setResettingPassword] = useState(false);
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
   const [businessName, setBusinessName] = useState('');
@@ -385,31 +270,17 @@ export default function App() {
   const [pinSetupDraft, setPinSetupDraft] = useState('');
   const [pinSetupConfirm, setPinSetupConfirm] = useState('');
   const [pinSetupBusy, setPinSetupBusy] = useState(false);
+  const backupFileInputRef = useRef(null);
   const activeStorageUserId = useRef(null);
   const pinInitializationGeneration = useRef(0);
   const pinSetupCompletedForUser = useRef(null);
-  const entitlement = entitlementState.userId === session?.user?.id
-    ? entitlementState.value
-    : createFreeEntitlement(session?.user?.id ? 'loading' : 'signed-out');
-  const isEmailConfirmationRedirect = useRef(
-    typeof window !== 'undefined' && (
-      new URLSearchParams(window.location.search).has('code') ||
-      new URLSearchParams(window.location.search).has('token_hash') ||
-      (window.location.hash.includes('access_token') && window.location.hash.includes('type=signup'))
-    )
-  );
+  const entitlement = createFreeEntitlement(session?.user?.id ? 'local' : 'signed-out');
 
   const initializePin = async (user) => {
     if (pinSetupCompletedForUser.current === user.id) return;
     const generation = ++pinInitializationGeneration.current;
     let localPin = await securePin.get(user.id);
     if (generation !== pinInitializationGeneration.current || pinSetupCompletedForUser.current === user.id) return;
-    const legacyPin = user.user_metadata?.ledger_pin;
-    if (!localPin && /^\d{4}$/.test(String(legacyPin || ''))) {
-      await securePin.store(user.id, legacyPin);
-      localPin = await securePin.get(user.id);
-      supabase.auth.updateUser({ data: { ledger_pin: null } }).catch(error => console.error('Could not remove legacy cloud PIN metadata:', error));
-    }
     if (!localPin) {
       await securePin.store(user.id, '1234');
       localPin = await securePin.get(user.id);
@@ -424,48 +295,14 @@ export default function App() {
     setDataLoading(true);
 
     try {
-      if (!storagePlatform.isWeb) {
-        await storageService.ensureUserStorage(userId);
-        let localData = await storageService.readLedger(userId);
-        if (localData.customers.length === 0 && localData.payments.length === 0) {
-          const legacyData = getStoredData(userId);
-          if (legacyData.customers.length > 0 || legacyData.payments.length > 0) {
-            await storageService.migrateLegacyLedger(userId, legacyData);
-            localData = await storageService.readLedger(userId);
-            if (localData.customers.length !== legacyData.customers.length || localData.payments.length !== legacyData.payments.length) {
-              throw new Error('Legacy ledger migration verification failed.');
-            }
-          }
-        }
-        setCustomers(localData.customers);
-        setPayments(localData.payments);
-        return;
-      }
-
-      const syncedData = await fetchUserDataFromSupabase(userId);
-      const localData = getStoredData(userId);
-      if (syncedData.customers.length === 0 && localData.customers.length > 0) {
-        await migrateLocalDataToSupabase(userId, localData);
-        const migratedData = await fetchUserDataFromSupabase(userId);
-        setCustomers(migratedData.customers);
-        setPayments(migratedData.payments);
-        localStorage.setItem(`sahukar-data-${userId}`, JSON.stringify(migratedData));
-        return;
-      }
-      const mergedData = mergeWebLedgers(localData, syncedData);
-      await syncPendingWebChanges(userId, localData, syncedData);
-      setCustomers(mergedData.customers);
-      setPayments(mergedData.payments);
-      localStorage.setItem(`sahukar-data-${userId}`, JSON.stringify(mergedData));
+      await storageService.ensureUserStorage(userId);
+      const localData = await storageService.readLedger(userId);
+      setCustomers(localData.customers);
+      setPayments(localData.payments);
+      setActionMessage({ type: '', text: '' });
     } catch (error) {
-      console.error('Failed to load ledger data:', error);
-      if (storagePlatform.isWeb) {
-        const storedData = getStoredData(userId);
-        setCustomers(storedData.customers);
-        setPayments(storedData.payments);
-      } else {
-        setActionMessage({ type: 'error', text: 'Local ledger could not be opened. Your data was not changed.' });
-      }
+      console.error('Failed to load local ledger data:', error);
+      setActionMessage({ type: 'error', text: error.message || 'Local ledger could not be opened. Your data was not changed.' });
     } finally {
       setDataLoading(false);
     }
@@ -473,46 +310,9 @@ export default function App() {
 
   const saveData = async (userId, nextCustomers, nextPayments) => {
     if (session?.user?.id !== userId) throw new Error('The active account changed; refusing to write ledger data.');
-
-    if (!storagePlatform.isWeb) {
-      const persisted = await storageService.writeLedger(userId, { customers: nextCustomers, payments: nextPayments });
-      setCustomers(persisted.customers);
-      setPayments(persisted.payments);
-      return;
-    }
-
-    const normalizedCustomers = nextCustomers.map(customer => ({
-      ...customer,
-      user_id: userId
-    }));
-
-    const normalizedPayments = nextPayments.map(payment => ({
-      ...payment,
-      customer_id: Number(payment.customer_id)
-    }));
-
-    try {
-      const { error: customerError } = await supabase
-        .from('customers')
-        .upsert(normalizedCustomers, { onConflict: 'id' });
-
-      if (customerError) throw customerError;
-
-      const { error: paymentError } = await supabase
-        .from('payments')
-        .upsert(normalizedPayments, { onConflict: 'id' });
-
-      if (paymentError) throw paymentError;
-
-      localStorage.setItem(`sahukar-data-${userId}`, JSON.stringify({ customers: nextCustomers, payments: nextPayments }));
-      setCustomers(nextCustomers);
-      setPayments(nextPayments);
-    } catch (error) {
-      console.error('Failed to sync ledger data to Supabase, saving locally instead:', error);
-      localStorage.setItem(`sahukar-data-${userId}`, JSON.stringify({ customers: nextCustomers, payments: nextPayments }));
-      setCustomers(nextCustomers);
-      setPayments(nextPayments);
-    }
+    const persisted = await storageService.writeLedger(userId, { customers: nextCustomers, payments: nextPayments });
+    setCustomers(persisted.customers);
+    setPayments(persisted.payments);
   };
 
   useEffect(() => {
@@ -520,228 +320,56 @@ export default function App() {
   }, [lang]);
 
   useEffect(() => {
-    let mounted = true;
-    supabase.auth.getSession().then(({ data: { session: nextSession } }) => {
-      if (!mounted) return;
-      setSession(nextSession);
-      if (nextSession?.user?.id) {
-        activeStorageUserId.current = nextSession.user.id;
-        initializePin(nextSession.user).catch(error => {
-          console.error('Could not initialize local PIN:', error);
-          setPinSetupRequired(true);
-          setPinLocked(true);
-        });
-        loadData(nextSession.user.id);
-      }
-      setLoading(false);
-    });
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
-      const nextUserId = nextSession?.user?.id || null;
-      const previousUserId = activeStorageUserId.current;
-      if (previousUserId && previousUserId !== nextUserId) {
-        pinInitializationGeneration.current += 1;
-        pinSetupCompletedForUser.current = null;
-        storageService.closeUserStorage(previousUserId).catch(error => console.error('Could not close previous local ledger:', error));
-        setCustomers([]);
-        setPayments([]);
-        setProfileCustomer(null);
-        setSelectedCust(null);
-      }
-      activeStorageUserId.current = nextUserId;
-      setSession(nextSession);
-      if (nextSession?.user?.id) {
-        initializePin(nextSession.user).catch(error => {
-          console.error('Could not initialize local PIN:', error);
-          setPinSetupRequired(true);
-          setPinLocked(true);
-        });
-        loadData(nextSession.user.id);
-      } else {
-        pinInitializationGeneration.current += 1;
-        pinSetupCompletedForUser.current = null;
-        setShowWelcome(true);
-        setCustomers([]);
-        setPayments([]);
-        setProfileCustomer(null);
-        setSelectedCust(null);
-        setPinLocked(false);
-      }
-      if (_event === 'SIGNED_IN' && nextSession?.user?.email_confirmed_at && isEmailConfirmationRedirect.current) {
-        isEmailConfirmationRedirect.current = false;
-        setEmailConfirmationReady(true);
-        setShowWelcome(false);
-      }
-      setLoading(false);
-    });
-
-    return () => {
-      mounted = false;
-      subscription.unsubscribe();
-    };
-  }, []);
-
-  useEffect(() => {
-    const userId = session?.user?.id;
-    if (!userId || !storagePlatform.isWeb || !supabaseReady) return undefined;
-
-    let cancelled = false;
-    let refreshTimer;
-    let pollingTimer;
-    let refreshInProgress = false;
-
-    const refreshRemoteLedger = async () => {
-      if (cancelled || refreshInProgress) return;
-      refreshInProgress = true;
-      try {
-        const [cloudData, localData] = await Promise.all([
-          fetchUserDataFromSupabase(userId),
-          Promise.resolve(getStoredData(userId))
-        ]);
-        if (cancelled) return;
-        await syncPendingWebChanges(userId, localData, cloudData);
-        if (cancelled) return;
-        const mergedData = mergeWebLedgers(localData, cloudData);
-        setCustomers(mergedData.customers);
-        setPayments(mergedData.payments);
-        localStorage.setItem(`sahukar-data-${userId}`, JSON.stringify(mergedData));
-      } catch (error) {
-        console.error('Automatic ledger refresh failed:', error);
-      } finally {
-        refreshInProgress = false;
-      }
-    };
-
-    const queueRefresh = () => {
-      window.clearTimeout(refreshTimer);
-      refreshTimer = window.setTimeout(() => { void refreshRemoteLedger(); }, 300);
-    };
-
-    const channel = supabase.channel(`ledger-sync-${userId}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'customers', filter: `user_id=eq.${userId}` }, queueRefresh)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'payments' }, queueRefresh)
-      .subscribe((status) => {
-        if (status === 'SUBSCRIBED') {
-          window.clearInterval(pollingTimer);
-          pollingTimer = undefined;
-        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-          if (!pollingTimer) pollingTimer = window.setInterval(() => { void refreshRemoteLedger(); }, 15000);
-        }
+    const user = restoredUser;
+    if (!user?.id) return undefined;
+    let active = true;
+    const timer = window.setTimeout(() => {
+      activeStorageUserId.current = user.id;
+      initializePin(user).catch(error => {
+        if (!active) return;
+        console.error('Could not initialize local PIN:', error);
+        setPinSetupRequired(true);
+        setPinLocked(true);
+      }).finally(() => {
+        if (active) setLoading(false);
       });
-
+      void loadData(user.id);
+    }, 0);
     return () => {
-      cancelled = true;
-      window.clearTimeout(refreshTimer);
-      window.clearInterval(pollingTimer);
-      void supabase.removeChannel(channel);
+      active = false;
+      window.clearTimeout(timer);
     };
-  }, [session?.user?.id]);
+  }, [restoredUser]);
 
-  useEffect(() => {
-    const userId = session?.user?.id;
-    if (!userId) return undefined;
-
-    let cancelled = false;
-    let pollTimer;
-    const applyRefresh = async () => {
-      const value = await refreshEntitlement(supabase, userId);
-      if (!cancelled) setEntitlementState({ userId, value });
-    };
-
-    void applyRefresh();
-
-    const channel = supabase.channel(`subscription-${userId}`)
-      .on('postgres_changes', {
-        event: '*',
-        schema: 'public',
-        table: 'subscriptions',
-        filter: `user_id=eq.${userId}`
-      }, () => { void applyRefresh(); })
-      .subscribe((status) => {
-        if (status === 'SUBSCRIBED') {
-          window.clearInterval(pollTimer);
-          pollTimer = undefined;
-        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-          if (!pollTimer) pollTimer = window.setInterval(() => { void applyRefresh(); }, 60000);
-        }
-      });
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(pollTimer);
-      void supabase.removeChannel(channel);
-    };
-  }, [session?.user?.id]);
-
-  // Auth Handler: Full Details Sign Up & Persistence Login
+  // Local account authentication and persistence.
   const handleAuth = async (e) => {
     e.preventDefault();
     setErrorMsg('');
     setSuccessMsg('');
 
-    if (!supabaseReady) {
-      setErrorMsg('Cloud sync is disabled because Supabase credentials are missing. Create a .env file with VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to enable the same account across devices.');
-      return;
-    }
-
     if (authBusy) return;
     setAuthBusy(true);
 
-    if (authMode === 'SIGNUP') {
-      if (!fullName || !phone || !email || !password) {
-        setErrorMsg('Kripya sabhi zaroori fields (*) bharein!');
-        setAuthBusy(false);
-        return;
-      }
-      const confirmationRedirect = /^https?:$/.test(window.location.protocol) ? `${window.location.origin}/` : undefined;
-      const { error } = await supabase.auth.signUp({
-        email: email.trim(),
-        password,
-        options: {
-          data: { full_name: fullName, phone_number: phone, business_name: businessName },
-          ...(confirmationRedirect ? { emailRedirectTo: confirmationRedirect } : {})
-        }
-      });
-      if (error) {
-        setErrorMsg(error.message);
-      } else {
-        setSuccessMsg('Account ban gaya. Ab aap sign in karke apna 4-digit PIN set kar sakte hain.');
+    try {
+      if (authMode === 'SIGNUP') {
+        await createLocalAccount({ fullName, phone, businessName, email, password });
+        setSuccessMsg('Local account created. Sign in on this browser to continue.');
         setAuthMode('LOGIN');
-      }
-    } else {
-      const { data, error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
-      if (error) {
-        setErrorMsg(error.message);
       } else {
-        setSession(data.session);
-        await initializePin(data.user);
-        await loadData(data.session.user.id);
+        const nextSession = await signInLocalAccount(email, password);
+        setActiveLocalUser(nextSession.user.id);
+        setSession(nextSession);
+        activeStorageUserId.current = nextSession.user.id;
+        setShowWelcome(false);
+        await initializePin(nextSession.user);
+        await loadData(nextSession.user.id);
         setPinLocked(true);
       }
+    } catch (error) {
+      setErrorMsg(error.message || 'Local account could not be saved.');
+    } finally {
+      setAuthBusy(false);
     }
-    setAuthBusy(false);
-  };
-
-  const handleForgotPassword = async () => {
-    setErrorMsg('');
-    setSuccessMsg('');
-
-    if (!email.trim()) {
-      setErrorMsg('Pehle apna email address enter karein.');
-      return;
-    }
-
-    if (resettingPassword) return;
-    setResettingPassword(true);
-    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-      redirectTo: `${window.location.origin}/reset-password`
-    });
-    setResettingPassword(false);
-    if (error) {
-      setErrorMsg(error.message);
-      return;
-    }
-    setSuccessMsg('Password reset link email par bhej diya gaya hai.');
   };
 
   // Dynamic Live Interest Calculation Logic
@@ -761,22 +389,33 @@ export default function App() {
       setActionMessage({ type: 'error', text: 'Kripya sabhi aavashyak (*) fields bharein!' });
       return;
     }
+    const principal = Number(custForm.principal);
+    const interestRate = Number(custForm.interest_rate);
+    if (!Number.isFinite(principal) || principal <= 0 || !Number.isFinite(interestRate) || interestRate < 0 || !Number.isFinite(Date.parse(custForm.loan_date))) {
+      setActionMessage({ type: 'error', text: 'Principal, interest rate, and loan date must be valid financial values.' });
+      return;
+    }
     const nextCustomer = {
-      id: Date.now(),
+      id: createPaymentId(),
       name: custForm.name,
       mobile: custForm.mobile,
       address: custForm.address,
       gov_id: custForm.gov_id,
-      principal: parseFloat(custForm.principal),
-      interest_rate: parseFloat(custForm.interest_rate),
+      principal,
+      interest_rate: interestRate,
       interest_type: custForm.interest_type,
       loan_date: custForm.loan_date,
       collateral: custForm.collateral,
-      gold_weight: parseFloat(custForm.gold_weight || 0),
+      gold_weight: Number(custForm.gold_weight || 0),
       notes: custForm.notes
     };
     const nextCustomers = [...customers, nextCustomer];
-    await saveData(session.user.id, nextCustomers, payments);
+    try {
+      await saveData(session.user.id, nextCustomers, payments);
+    } catch (error) {
+      setActionMessage({ type: 'error', text: error.message || 'Customer could not be saved locally.' });
+      return;
+    }
     {
       setActionMessage({ type: 'success', text: 'Naya grahak record safaltapoorvak saheja gaya!' });
       setCustForm({
@@ -802,12 +441,22 @@ export default function App() {
   };
 
   const handleProcessPayment = async () => {
-    if (!selectedCust || !payAmount || Number(payAmount) <= 0) {
+    const paid = Number(payAmount);
+    if (!selectedCust || !Number.isFinite(paid) || paid <= 0) {
       setActionMessage({ type: 'error', text: 'Valid payment amount enter karein.' });
       return;
     }
-    const paid = parseFloat(payAmount);
-    const payment = processPartPayment(selectedCust.principal, selectedCust.interest, paid);
+    if (paid > Number(selectedCust.total) + 0.01) {
+      setActionMessage({ type: 'error', text: 'Payment amount cannot exceed the current payable balance.' });
+      return;
+    }
+    let payment;
+    try {
+      payment = processPartPayment(selectedCust.principal, selectedCust.interest, paid);
+    } catch (error) {
+      setActionMessage({ type: 'error', text: error.message || 'Payment values are invalid.' });
+      return;
+    }
     const { interestPaid: intPaid, principalDeducted: princPaid, remainingPrincipal: newPrinc } = payment;
     const paymentNumber = payments.filter(paymentItem => paymentItem.customer_id === selectedCust.id).length + 1;
 
@@ -831,7 +480,12 @@ export default function App() {
       principal_paid: princPaid,
       remaining_principal: newPrinc
     };
-    await saveData(session.user.id, nextCustomers, [nextPayment, ...payments]);
+    try {
+      await saveData(session.user.id, nextCustomers, [nextPayment, ...payments]);
+    } catch (error) {
+      setActionMessage({ type: 'error', text: error.message || 'Payment could not be saved locally.' });
+      return;
+    }
 
     const receiptAvailable = hasFeature('pdf_receipts', entitlement);
     if (receiptAvailable) {
@@ -881,7 +535,15 @@ export default function App() {
     const principal = Number(calc.currentPrincipal ?? customer.principal ?? 0);
     const total = Number(calc.totalPayableNow ?? calc.total ?? principal + interest);
     const mode = String(customer.interest_type || 'SIMPLE').toUpperCase();
-    const message = `Namaste ${customer.name}, Customer ID ${customer.id}. Aapka ${mode.toLowerCase()} interest ₹${interest.toFixed(2)} hai; baki principal ₹${principal.toFixed(2)} hai. Total payable ₹${total.toFixed(2)} hai. - Sahukar Ledger Pro`;
+    const message = `*मासिक ब्याज भुगतान सूचना*
+
+Namaste ${customer.name} ji,
+Is mahine aapka baki byaaj *₹${interest.toFixed(2)}* hai.
+
+Kripya is mahine ka baki byaaj samay par jama karein. Bhugtan ke baad confirmation bhej dein, taaki aapka record update kiya ja sake.
+
+Aapke sahyog ke liye dhanyavaad.
+*Sahukar Ledger Pro*`;
     openWhatsAppMessage(customer.mobile, message);
   };
 
@@ -998,10 +660,6 @@ export default function App() {
   };
 
   const exportBackup = async () => {
-    if (!hasFeature('backup_restore', entitlement)) {
-      setActionMessage({ type: 'error', text: 'Backup and restore are Pro features. Your ledger remains saved; upgrade checkout will be available soon.' });
-      return;
-    }
     if (!storagePlatform.isWeb) {
       try {
         const result = await storageService.exportBackup(session.user.id);
@@ -1012,21 +670,56 @@ export default function App() {
       }
       return;
     }
-    const backup = JSON.stringify({ exportedAt: new Date().toISOString(), customers, payments }, null, 2);
-    const blob = new Blob([backup], { type: 'application/json' });
+    downloadBackup(serializeJsonBackup(getSessionProfile(session), { customers, payments }), 'application/json', 'json');
+  };
+
+  const exportCsvBackup = () => {
+    downloadBackup(serializeCsvBackup(getSessionProfile(session), { customers, payments }), 'text/csv;charset=utf-8', 'csv');
+  };
+
+  const downloadBackup = (contents, mimeType, extension) => {
+    const blob = new Blob([contents], { type: mimeType });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `sahukar-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    link.download = `sahukar-backup-${new Date().toISOString().slice(0, 10)}.${extension}`;
     link.click();
     URL.revokeObjectURL(url);
-    setActionMessage({ type: 'success', text: 'Backup file download ho gayi.' });
+    setActionMessage({ type: 'success', text: `Backup ${extension.toUpperCase()} download ho gayi.` });
   };
 
-  const handleRefreshData = async () => {
-    if (!session?.user?.id) return;
-    await loadData(session.user.id);
-    setActionMessage({ type: 'success', text: 'Latest ledger data sync ho gaya.' });
+  const handleImportBackup = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const backup = parseBackup(await file.text(), file.name);
+      const customerCount = backup.ledger.customers.length;
+      const paymentCount = backup.ledger.payments.length;
+      if (!window.confirm(`Replace this browser's ledger with ${customerCount} customer(s) and ${paymentCount} transaction(s)?`)) return;
+      await saveData(session.user.id, backup.ledger.customers, backup.ledger.payments);
+      if (backup.profile) {
+        const profile = updateLocalProfile(session.user.id, backup.profile);
+        setSession(current => ({
+          ...current,
+          user: {
+            ...current.user,
+            email: profile.email || current.user.email,
+            phone: profile.phone_number,
+            user_metadata: {
+              full_name: profile.full_name,
+              phone_number: profile.phone_number,
+              business_name: profile.business_name
+            }
+          }
+        }));
+      }
+      setActionMessage({ type: 'success', text: 'Backup restore ho gaya. Ledger aur profile local browser mein save hain.' });
+    } catch (error) {
+      console.error('Backup import failed:', error);
+      setActionMessage({ type: 'error', text: error.message || 'Backup restore nahi ho saka. Existing data was left unchanged.' });
+    } finally {
+      event.target.value = '';
+    }
   };
 
   if (loading) {
@@ -1034,21 +727,6 @@ export default function App() {
   }
 
   // 1. AUTHENTICATION GUI
-  if (emailConfirmationReady) {
-    return (
-      <AccountReady
-        hasSession={Boolean(session?.user)}
-        onContinue={() => setEmailConfirmationReady(false)}
-        onLogin={() => {
-          setEmailConfirmationReady(false);
-          setSession(null);
-          setAuthMode('LOGIN');
-          setShowWelcome(false);
-        }}
-      />
-    );
-  }
-
   if (!session) {
     if (showWelcome) {
       return (
@@ -1114,17 +792,8 @@ export default function App() {
 
             <div>
               <label className="block text-sm font-bold text-slate-700 mb-1">Password *</label>
-              <input type="password" required className="w-full p-2.5 border rounded-lg focus:ring-2 focus:ring-blue-500 font-semibold" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" />
-              {authMode === 'LOGIN' && (
-                <button
-                  type="button"
-                  onClick={handleForgotPassword}
-                  disabled={resettingPassword}
-                  className="mt-2 text-sm font-semibold text-slate-500 hover:text-blue-600 disabled:opacity-50"
-                >
-                  {resettingPassword ? 'Checking account...' : 'Check password reset'}
-                </button>
-              )}
+              <input type="password" required minLength={authMode === 'SIGNUP' ? 8 : undefined} className="w-full p-2.5 border rounded-lg focus:ring-2 focus:ring-blue-500 font-semibold" value={password} onChange={e => setPassword(e.target.value)} placeholder="At least 8 characters" />
+              <p className="mt-2 text-xs text-slate-500">Account and password stay in this browser. Password recovery is not available without a cloud account.</p>
             </div>
 
             <button type="submit" disabled={authBusy} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg shadow-md text-base transition duration-150 disabled:cursor-not-allowed disabled:opacity-60">
@@ -1256,8 +925,17 @@ export default function App() {
           >
             Android Download
           </button>
-          <button 
-            onClick={() => supabase.auth.signOut()}
+          <button
+            onClick={() => {
+              signOutLocalAccount();
+              setSession(null);
+              setCustomers([]);
+              setPayments([]);
+              setProfileCustomer(null);
+              setSelectedCust(null);
+              setPinLocked(false);
+              setShowWelcome(true);
+            }}
             className="bg-red-600 hover:bg-red-700 font-bold px-4 py-2 rounded text-sm text-white transition">
             Log Out
           </button>
@@ -1477,26 +1155,21 @@ export default function App() {
         {activeTab === 'tools' && (
           <div className="bg-white p-8 rounded-lg shadow-md border max-w-2xl space-y-4">
             <h2 className="text-xl font-bold text-slate-800 border-b pb-2">{lang === 'HI' ? 'डेटाबेस व सुरक्षा टूल्स' : 'Database & Security Tools'}</h2>
-            <p className="text-base text-slate-600">Demo mode: your ledger is saved securely in this browser. Cloud sync can be added later.</p>
+            <p className="text-base text-slate-600">Your account and ledger are stored only in this browser. Download backups regularly; clearing browser data removes local records.</p>
             <div className="settings-block" aria-live="polite">
               <h3 className="font-bold text-slate-800">Subscription</h3>
               <p className="mt-2 text-sm text-slate-600">
                 Current plan: <strong>{getCurrentPlan(entitlement) === 'pro' ? `Pro${entitlement.billing_cycle ? ` ${entitlement.billing_cycle}` : ''}` : 'Free'}</strong>
                 {' · '}Status: <strong>{getSubscriptionStatus(entitlement)}</strong>
-                {entitlement.source === 'cached' && <span> · Cached status</span>}
-                {entitlement.source === 'offline' && <span> · Offline, Free access</span>}
+                {entitlement.source === 'local' && <span> · Local account</span>}
               </p>
               {entitlement.expiry_date && <p className="mt-1 text-sm text-slate-600">Expiry: {new Date(entitlement.expiry_date).toLocaleDateString()}</p>}
               {!isPro(entitlement) && <p className="mt-1 text-xs text-slate-500">Free plan: {customers.length}/{FREE_CUSTOMER_LIMIT} customers. Existing ledger data is never removed by plan limits.</p>}
-              {entitlement.source === 'cached' && entitlement.checkedAt && <p className="mt-1 text-xs text-slate-500">Last verified: {new Date(entitlement.checkedAt).toLocaleString()}</p>}
               <button type="button" onClick={() => setActionMessage({ type: 'success', text: `Pro plans: ₹${PLAN_PRICING.proMonthly}/month or ₹${PLAN_PRICING.proYearly}/year. Payment checkout is not enabled yet.` })} className="mt-3 rounded-lg border border-slate-300 px-4 py-2 font-bold text-slate-700 transition hover:border-cyan-600 hover:text-cyan-700">
                 Upgrade to Pro · ₹{PLAN_PRICING.proMonthly}/month · ₹{PLAN_PRICING.proYearly}/year
               </button>
             </div>
             <div className="flex flex-wrap gap-3 pt-2">
-              <button onClick={handleRefreshData} className="rounded-lg bg-slate-900 px-4 py-2.5 font-bold text-white transition hover:bg-slate-700 disabled:opacity-50" disabled={dataLoading}>
-                {dataLoading ? 'Syncing...' : 'Refresh Data'}
-              </button>
               <button
                 type="button"
                 onClick={() => triggerDirectDownload(WINDOWS_DOWNLOAD_URL)}
@@ -1511,9 +1184,12 @@ export default function App() {
               >
                 Download for Android
               </button>
-              <button onClick={exportBackup} className="rounded-lg border border-slate-300 px-4 py-2.5 font-bold text-slate-700 transition hover:border-cyan-600 hover:text-cyan-700">
-                Download Backup
-              </button>
+              <button onClick={exportBackup} className="rounded-lg border border-slate-300 px-4 py-2.5 font-bold text-slate-700 transition hover:border-cyan-600 hover:text-cyan-700">Download JSON Backup</button>
+              {storagePlatform.isWeb && <>
+                <button onClick={exportCsvBackup} className="rounded-lg border border-slate-300 px-4 py-2.5 font-bold text-slate-700 transition hover:border-cyan-600 hover:text-cyan-700">Download CSV Backup</button>
+                <button type="button" onClick={() => backupFileInputRef.current?.click()} className="rounded-lg bg-cyan-700 px-4 py-2.5 font-bold text-white transition hover:bg-cyan-800">Import JSON / CSV</button>
+                <input ref={backupFileInputRef} type="file" accept=".json,.csv,application/json,text/csv" onChange={handleImportBackup} className="hidden" aria-label="Choose a JSON or CSV backup file" />
+              </>}
               <button onClick={() => setPinLocked(true)} className="action-button action-button--dark"><LockKeyhole size={16} /> Lock now</button>
             </div>
             <div className="settings-block">
